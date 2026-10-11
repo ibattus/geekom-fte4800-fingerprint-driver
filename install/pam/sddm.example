@@ -1,0 +1,24 @@
+#%PAM-1.0
+
+# Local fingerprint authentication; password remains available.
+auth requisite pam_shells.so
+auth requisite pam_nologin.so
+auth requisite pam_faillock.so preauth
+# Scan first; after 15 seconds offer the normal password prompt.
+auth [success=1 default=ignore] pam_fprintd.so max-tries=3 timeout=15
+auth substack system-login
+auth required pam_env.so
+auth required pam_faillock.so authsucc
+# End local fingerprint authentication.
+-auth       optional    pam_gnome_keyring.so
+-auth       optional    pam_kwallet5.so
+
+account     include     system-login
+
+password    include     system-login
+-password   optional    pam_gnome_keyring.so    use_authtok
+
+session     optional    pam_keyinit.so          force revoke
+session     include     system-login
+-session    optional    pam_gnome_keyring.so    auto_start
+-session    optional    pam_kwallet5.so         auto_start

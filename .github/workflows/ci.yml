@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  source-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run repository tests
+        run: tests/run-tests.sh
+      - name: Shell syntax
+        run: |
+          for script in install/*.sh tests/run-tests.sh tools/*.sh packaging/arch/PKGBUILD packaging/arch/focaltech-fte4800.install; do
+            bash -n "$script" || exit
+          done
+      - name: Check whitespace
+        run: git diff --check

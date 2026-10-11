@@ -1,0 +1,1804 @@
+diff --git a/libfprint/drivers/fte4800.c b/libfprint/drivers/fte4800.c
+new file mode 100644
+index 00000000..ca44fc84
+--- /dev/null
++++ b/libfprint/drivers/fte4800.c
+@@ -0,0 +1,879 @@
++/*
++ * FocalTech FTE4800 / FT9368 SPI Image Driver for libfprint
++ * Copyright (C) 2026
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ *
++ * Matching strategy:
++ *   Enrollment and verification are delegated to FocalTech's native WinBio
++ *   engine adapter, executed directly on Linux by vendor-engine.c. The engine
++ *   consumes the sensor's native 64×80 grayscale frame and stores an opaque
++ *   vendor template in the FpPrint payload.
++ */
++
++#define FP_COMPONENT "fte4800"
++
++#include "drivers_api.h"
++#include "fte4800.h"
++#include "vendor-engine.h"
++
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <errno.h>
++
++/* --------------------------------------------------------------------------
++ * Parameters
++ * -------------------------------------------------------------------------- */
++#define FTE4800_ENROLL_STAGES         12 /* FocalTech engine maximum enrollment samples */
++#define FTE4800_TOUCH_VAR_THRESH     350
++#define FTE4800_ENROLL_MIN_VAR      1200
++#define FTE4800_POLL_MS             250
++#define FTE4800_VENDOR_MAGIC       "FTV1"
++#define FTE4800_VENDOR_HEADER       8
++#define FTE4800_VENDOR_MAX_TEMPLATE (1024 * 1024)
++#define FTE4800_VENDOR_DLL         "/usr/lib/focaltech-fte4800/ftWbioEngineAdapter.dll"
++
++/* --------------------------------------------------------------------------
++ * Device instance data
++ * -------------------------------------------------------------------------- */
++struct _FpiDeviceFte4800
++{
++  FpImageDevice parent;
++
++  int           spi_fd;
++  gboolean      deactivating;
++
++  gint          enroll_count;
++};
++
++G_DECLARE_FINAL_TYPE (FpiDeviceFte4800, fpi_device_fte4800, FPI, DEVICE_FTE4800, FpImageDevice);
++G_DEFINE_TYPE (FpiDeviceFte4800, fpi_device_fte4800, FP_TYPE_IMAGE_DEVICE);
++
++/* --------------------------------------------------------------------------
++ * Low-level SPI helpers
++ * -------------------------------------------------------------------------- */
++
++/*
++ * Send tx_buf / receive rx_len bytes via the focal_spi kernel misc device.
++ * Header format: [0xA5, tx_len_lo, tx_len_hi, rx_len_lo, rx_len_hi, <tx_bytes>]
++ * The kernel driver returns rx_len bytes starting at offset 0 of the same buf.
++ */
++static int
++fte4800_spi_transfer (int fd, const guint8 *tx, gsize tx_len,
++                      guint8 *rx, gsize rx_len)
++{
++  gsize buf_len = MAX (5 + tx_len, rx_len);
++  g_autofree guint8 *buf = g_malloc0 (buf_len);
++
++  buf[0] = 0xA5;
++  buf[1] = (guint8) (tx_len & 0xFF);
++  buf[2] = (guint8) ((tx_len >> 8) & 0xFF);
++  buf[3] = (guint8) (rx_len & 0xFF);
++  buf[4] = (guint8) ((rx_len >> 8) & 0xFF);
++  if (tx && tx_len)
++    memcpy (buf + 5, tx, tx_len);
++
++  ssize_t n = read (fd, buf, buf_len);
++  if (n < 0)
++    return -errno;
++  if ((gsize) n < rx_len)
++    return -EIO;
++  if (rx && rx_len)
++    memcpy (rx, buf, rx_len);
++  return 0;
++}
++
++/* Read one 64×80 raw grayscale frame. */
++static int
++fte4800_write (int fd, const guint8 *tx, gsize tx_len)
++{
++  gsize buf_len = 5 + tx_len;
++  guint8 *buf = g_malloc0 (buf_len);
++
++  buf[0] = 0xA5;
++  buf[1] = (guint8) (tx_len & 0xFF);
++  buf[2] = (guint8) ((tx_len >> 8) & 0xFF);
++  buf[3] = 0;
++  buf[4] = 0;
++  if (tx_len)
++    memcpy (buf + 5, tx, tx_len);
++
++  ssize_t n = write (fd, buf, buf_len);
++  g_free (buf);
++  if (n < 0)
++    return -errno;
++  return ((gsize) n == buf_len) ? 0 : -EIO;
++}
++
++/* Trigger one physical FT9368 scan.  The sensor populates its image FIFO
++ * asynchronously; ~60 ms is the measured safe integration window. */
++static int
++fte4800_trigger_capture (int fd)
++{
++  static const guint8 tx[11] = {
++    0x70, 0x07, 0xF8,
++    0x00, 0x3B, 0x00, 0x00,
++    0x00, 0x01, 0x00, 0x00
++  };
++
++  int ret = fte4800_write (fd, tx, sizeof (tx));
++  if (ret < 0)
++    return ret;
++  g_usleep (60 * 1000);
++  return 0;
++}
++
++static int
++fte4800_read_frame (int fd, guint8 *out)
++{
++  static const guint8 tx[7] = { 0x90, 0x80, 0x14, 0x00, 0x00, 0x00, 0x00 };
++  return fte4800_spi_transfer (fd, tx, sizeof (tx), out, FTE4800_RAW_PIXELS);
++}
++
++/* Verify sensor identity (retries until chip-ID 0x9368 appears). */
++static gboolean
++fte4800_read_chip_id (int fd, guint16 *id_out)
++{
++  static const guint8 tx[7] = { 0x91, 0x80, 0x00, 0x20, 0x00, 0x00, 0x00 };
++  guint8 rx[32];
++
++  for (int i = 0; i < 6; i++)
++    {
++      if (fte4800_spi_transfer (fd, tx, sizeof (tx), rx, sizeof (rx)) == 0)
++        {
++          guint16 id = ((guint16) rx[0x13] << 8) | rx[0x14];
++          if (id == 0x9368)
++            {
++              if (id_out) *id_out = id;
++              return TRUE;
++            }
++        }
++      g_usleep (50 * 1000);
++    }
++  return FALSE;
++}
++
++/* A freshly triggered FT9368 frame is the reliable signal source for
++ * this implementation.
++ *
++ * HARDWARE EVIDENCE: The 0x9180 status register byte[1] reads 0x11 in
++ * approximately 100% of polls regardless of whether a finger is present
++ * (confirmed by dataset analysis: 1121/1337 polls = 83.8% always-on, with
++ * the remaining variation being random noise — not correlated with touch).
++ * byte[2] is 0x11 only 5/1337 times total. Neither byte reliably indicates
++ * finger presence, so we do NOT use this register for touch detection.
++ *
++ * RELIABLE APPROACH: After a hardware reset (IOCTL 0x8086), the FT9368
++ * image buffer is fully blanked. A subsequent triggered capture returns
++ * Var=0.0 when no finger is present, and Var>>threshold when a finger is
++ * pressed. This has been confirmed on the physical FT9368 sensor. */
++static gboolean
++fte4800_image_has_signal (const guint8 *px, gsize n)
++{
++  return fpi_std_sq_dev (px, n) > FTE4800_TOUCH_VAR_THRESH;
++}
++
++static gboolean
++fte4800_image_is_good (const guint8 *px, gsize n)
++{
++  /*
++   * Do not impose generic brightness/saturation heuristics here. Real FTE4800
++   * captures have a high mean and a large saturated region, while the vendor
++   * engine still classifies them as usable. The vendor engine is authoritative
++   * for fingerprint quality; this gate only rejects blank/low-contrast frames.
++   */
++  return fpi_std_sq_dev (px, n) >= FTE4800_ENROLL_MIN_VAR;
++}
++
++/* Forward declaration for the blocking capture helper used by the
++ * finger-edge detectors below. */
++static gboolean
++fte4800_capture_frame_blocking (FpiDeviceFte4800 *self, guint8 *frame);
++
++/* Issue a hardware reset and wait for sensor firmware to boot.
++ * This is mandatory before reliable finger-absent detection because the
++ * FT9368 image buffer retains the last captured frame indefinitely after
++ * finger removal — stale data reads as Var>>0 even with no finger present.
++ * After reset the buffer is blank; the next trigger returns Var=0 or Var>thresh
++ * according to actual sensor state. */
++static void
++fte4800_hw_reset (FpiDeviceFte4800 *self)
++{
++  guint8 throwaway[2];
++
++  if (ioctl (self->spi_fd, FTE4800_IOCTL_RESET, 0) < 0)
++    fp_warn ("hw-reset ioctl failed: %s", g_strerror (errno));
++
++  /* Kernel driver already waits 350ms for chip auto-boot during IOCTL_RESET.
++   * Discard the first post-reset read to clear SPI shift-register residue. */
++  fte4800_spi_transfer (self->spi_fd,
++                        (const guint8[]) { 0x91, 0x80, 0x00, 0x02, 0x00, 0x00, 0x00 },
++                        7, throwaway, sizeof (throwaway));
++}
++
++/* WAIT_DOWN: poll with fresh triggered captures until the sensor reports
++ * a real contact signal.  Called immediately after fte4800_hw_reset(), so
++ * the image buffer is blank and any Var>threshold is a genuine new press. */
++static gboolean
++fte4800_wait_finger_down (FpiDeviceFte4800 *self,
++                          GCancellable *cancel,
++                          guint8 *frame)
++{
++  for (;;)
++    {
++      if (g_cancellable_is_cancelled (cancel))
++        return FALSE;
++
++      /* Trigger + read.  After a reset this reliably returns Var=0 when no
++       * finger is present. */
++      if (!fte4800_capture_frame_blocking (self, frame))
++        {
++          g_usleep (FTE4800_POLL_MS * 1000);
++          continue;
++        }
++
++      if (fte4800_image_has_signal (frame, FTE4800_RAW_PIXELS))
++        return TRUE;
++
++      g_usleep (FTE4800_POLL_MS * 1000);
++    }
++}
++
++/* WAIT_UP: reset the hardware buffer, then poll until a fresh capture
++ * returns no signal (Var <= threshold).  The reset is the key step: without
++ * it the FT9368 returns stale finger-image data for an indefinite time after
++ * the finger is lifted, making release detection impossible via variance alone.
++ *
++ * This wait is intentionally unbounded and only completes on confirmed release
++ * or cancellation. */
++static gboolean
++fte4800_wait_finger_up (FpiDeviceFte4800 *self,
++                        GCancellable *cancel,
++                        guint8 *frame)
++{
++  for (;;)
++    {
++      if (g_cancellable_is_cancelled (cancel))
++        return FALSE;
++
++      /* Reset the hardware buffer on every check so finger absence reliably
++       * produces a blank frame. Without reset between checks, FT9368's internal
++       * SRAM retains the prior frame if the finger was still pressed during
++       * the previous capture. */
++      fte4800_hw_reset (self);
++
++      if (!fte4800_capture_frame_blocking (self, frame))
++        {
++          g_usleep (FTE4800_POLL_MS * 1000);
++          continue;
++        }
++
++      if (!fte4800_image_has_signal (frame, FTE4800_RAW_PIXELS))
++        {
++          /* No signal — finger is absent. Report NONE + NEEDED now that
++           * finger is confirmed physically released. */
++          fpi_device_report_finger_status (FP_DEVICE (self),
++                                           FP_FINGER_STATUS_NONE | FP_FINGER_STATUS_NEEDED);
++          return TRUE;
++        }
++
++      /* Signal still present — user is still holding the finger. */
++      fpi_device_report_finger_status (FP_DEVICE (self),
++                                       FP_FINGER_STATUS_PRESENT);
++      g_usleep (FTE4800_POLL_MS * 1000);
++    }
++}
++
++/* --------------------------------------------------------------------------
++ * Vendor template storage in FpPrint
++ *
++ * FTV1 layout:
++ *   magic[4] + vendor_template_size_le32[4] + opaque vendor blob
++ * The vendor engine owns the internal fingerprint representation; libfprint
++ * stores it without interpreting or rewriting the template.
++ * -------------------------------------------------------------------------- */
++
++static gboolean
++fte4800_engine_available (void)
++{
++  const gchar *path = g_getenv ("FTE4800_ENGINE_DLL");
++
++  return path && *path
++         ? g_file_test (path, G_FILE_TEST_IS_REGULAR)
++         : g_file_test (FTE4800_VENDOR_DLL, G_FILE_TEST_IS_REGULAR);
++}
++
++static const gchar *
++fte4800_engine_path (void)
++{
++  const gchar *path = g_getenv ("FTE4800_ENGINE_DLL");
++  return path && *path ? path : FTE4800_VENDOR_DLL;
++}
++
++static gboolean
++fte4800_set_print_template (FpPrint *print,
++                            const guint8 *template,
++                            gsize template_len)
++{
++  gsize payload;
++  guint8 *buf;
++  GVariant *data;
++
++  if (!template || template_len == 0 || template_len > FTE4800_VENDOR_MAX_TEMPLATE)
++    return FALSE;
++
++  payload = FTE4800_VENDOR_HEADER + template_len;
++  buf = g_malloc (payload);
++  memcpy (buf, FTE4800_VENDOR_MAGIC, 4);
++  buf[4] = (guint8) (template_len & 0xff);
++  buf[5] = (guint8) ((template_len >> 8) & 0xff);
++  buf[6] = (guint8) ((template_len >> 16) & 0xff);
++  buf[7] = (guint8) ((template_len >> 24) & 0xff);
++  memcpy (buf + FTE4800_VENDOR_HEADER, template, template_len);
++
++  data = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
++                                     buf, payload, sizeof (guint8));
++  fpi_print_set_type (print, FPI_PRINT_RAW);
++  g_object_set (print, "fpi-data", data, NULL);
++  g_free (buf);
++  return TRUE;
++}
++
++static guint8 *
++fte4800_get_print_template (FpPrint *print, gsize *template_len_out)
++{
++  GVariant *data = NULL;
++  const guint8 *raw;
++  gsize n = 0;
++  gsize len;
++
++  if (template_len_out)
++    *template_len_out = 0;
++
++  g_object_get (print, "fpi-data", &data, NULL);
++  if (!data)
++    return NULL;
++
++  raw = g_variant_get_fixed_array (data, &n, sizeof (guint8));
++  if (!raw || n < FTE4800_VENDOR_HEADER ||
++      memcmp (raw, FTE4800_VENDOR_MAGIC, 4) != 0)
++    {
++      g_variant_unref (data);
++      return NULL;
++    }
++
++  len = (gsize) raw[4] |
++        ((gsize) raw[5] << 8) |
++        ((gsize) raw[6] << 16) |
++        ((gsize) raw[7] << 24);
++
++  if (len == 0 || len > FTE4800_VENDOR_MAX_TEMPLATE ||
++      n != FTE4800_VENDOR_HEADER + len)
++    {
++      g_variant_unref (data);
++      return NULL;
++    }
++
++  guint8 *out = g_memdup2 (raw + FTE4800_VENDOR_HEADER, len);
++  g_variant_unref (data);
++  if (template_len_out)
++    *template_len_out = len;
++  return out;
++}
++
++/* --------------------------------------------------------------------------
++ * Blocking capture helper (runs in a GTask worker thread)
++ *
++ * Triggers a physical scan, reads the resulting frame, and accepts it only
++ * when the frame has sufficient contact contrast.
++ * -------------------------------------------------------------------------- */
++static gboolean
++fte4800_capture_frame_blocking (FpiDeviceFte4800 *self, guint8 *frame)
++{
++  if (fte4800_trigger_capture (self->spi_fd) != 0)
++    return FALSE;
++
++  return fte4800_read_frame (self->spi_fd, frame) == 0;
++}
++
++/* --------------------------------------------------------------------------
++ * Open / Close / Activate / Deactivate (standard FpImageDevice plumbing)
++ * -------------------------------------------------------------------------- */
++static void
++fte4800_open (FpImageDevice *imgdev)
++{
++  FpiDeviceFte4800 *self = FPI_DEVICE_FTE4800 (imgdev);
++  guint16 chip_id = 0;
++  GError *err = NULL;
++  const gchar *path;
++  int fd;
++
++  G_DEBUG_HERE ();
++
++  path = fpi_device_get_udev_data (FP_DEVICE (imgdev), FPI_DEVICE_UDEV_SUBTYPE_MISC);
++  if (!path)
++    path = "/dev/focal_moh_spi";
++
++  fd = open (path, O_RDWR | O_CLOEXEC);
++  if (fd < 0)
++    {
++      err = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                      "open(%s): %s", path, g_strerror (errno));
++      fpi_image_device_open_complete (imgdev, err);
++      return;
++    }
++
++  if (ioctl (fd, FTE4800_IOCTL_RESET, 0) < 0)
++    fp_warn ("Reset ioctl failed: %s", g_strerror (errno));
++
++  /* Discard the first post-reset read: FT9368 can return SPI shift-register
++   * residue before application firmware has produced a stable response. */
++  {
++    guint8 throwaway[2];
++    if (fte4800_spi_transfer (fd,
++                              (const guint8[]) { 0x91, 0x80, 0x00, 0x02, 0x00, 0x00, 0x00 },
++                              7, throwaway, sizeof (throwaway)) != 0)
++      fp_warn ("post-reset throwaway read failed: %s", g_strerror (errno));
++  }
++
++  if (!fte4800_read_chip_id (fd, &chip_id))
++    {
++      close (fd);
++      err = fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
++                                      "%s: FT9368 not detected", path);
++      fpi_image_device_open_complete (imgdev, err);
++      return;
++    }
++
++  if (!fte4800_engine_available ())
++    {
++      close (fd);
++      err = fpi_device_error_new_msg (
++        FP_DEVICE_ERROR_NOT_SUPPORTED,
++        "FocalTech vendor engine not found at %s (set FTE4800_ENGINE_DLL to override)",
++        fte4800_engine_path ());
++      fpi_image_device_open_complete (imgdev, err);
++      return;
++    }
++
++  if (ft_engine_open (fte4800_engine_path ()) != 0)
++    {
++      close (fd);
++      err = fpi_device_error_new_msg (
++        FP_DEVICE_ERROR_GENERAL,
++        "FocalTech vendor engine failed to initialize");
++      fpi_image_device_open_complete (imgdev, err);
++      return;
++    }
++
++  fp_info ("FocalTech FT9368 (0x%04x) at %s; vendor engine ready", chip_id, path);
++  self->spi_fd = fd;
++
++  fpi_image_device_open_complete (imgdev, NULL);
++}
++
++static void
++fte4800_close (FpImageDevice *imgdev)
++{
++  FpiDeviceFte4800 *self = FPI_DEVICE_FTE4800 (imgdev);
++
++  G_DEBUG_HERE ();
++
++  if (self->spi_fd >= 0)
++    {
++      close (self->spi_fd);
++      self->spi_fd = -1;
++    }
++  fpi_image_device_close_complete (imgdev, NULL);
++}
++
++static void
++fte4800_activate (FpImageDevice *imgdev)
++{
++  G_DEBUG_HERE ();
++  FPI_DEVICE_FTE4800 (imgdev)->deactivating = FALSE;
++  fpi_image_device_activate_complete (imgdev, NULL);
++}
++
++static void
++fte4800_deactivate (FpImageDevice *imgdev)
++{
++  G_DEBUG_HERE ();
++  FPI_DEVICE_FTE4800 (imgdev)->deactivating = TRUE;
++  fpi_image_device_deactivate_complete (imgdev, NULL);
++}
++
++static void
++fte4800_change_state (FpImageDevice *imgdev, FpiImageDeviceState state)
++{
++  /* Enrollment and verification are implemented by the driver because the
++   * FT9368 uses the native FocalTech WinBio engine. */
++  G_DEBUG_HERE ();
++}
++
++/* --------------------------------------------------------------------------
++ * Custom Enroll
++ * -------------------------------------------------------------------------- */
++typedef struct {
++  FpiDeviceFte4800 *self;
++  FpPrint          *enroll_print;
++} EnrollData;
++
++static void
++fte4800_enroll_thread (GTask *task, gpointer src,
++                       gpointer task_data, GCancellable *cancel)
++{
++  EnrollData *ed = task_data;
++  FpiDeviceFte4800 *self = ed->self;
++  guint8 frame[FTE4800_RAW_PIXELS];
++
++  ft_engine_enroll_begin ();
++  fte4800_hw_reset (self);
++
++  fpi_device_report_finger_status (FP_DEVICE (self),
++                                   FP_FINGER_STATUS_NONE | FP_FINGER_STATUS_NEEDED);
++
++  while (self->enroll_count < FTE4800_ENROLL_STAGES)
++    {
++      if (g_task_return_error_if_cancelled (task))
++        return;
++
++      if (!fte4800_wait_finger_down (self, cancel, frame))
++        {
++          g_task_return_error_if_cancelled (task);
++          return;
++        }
++
++      fpi_device_report_finger_status (FP_DEVICE (self), FP_FINGER_STATUS_PRESENT);
++
++      if (!fte4800_image_is_good (frame, FTE4800_RAW_PIXELS))
++        {
++          GError *retry = fpi_device_retry_new_msg (
++            FP_DEVICE_RETRY_GENERAL,
++            "Scan quality is too low. Keep finger flat and press gently.");
++          fpi_device_enroll_progress (FP_DEVICE (self),
++                                      self->enroll_count, NULL, retry);
++
++          if (!fte4800_wait_finger_up (self, cancel, frame))
++            {
++              g_task_return_error_if_cancelled (task);
++              return;
++            }
++          continue;
++        }
++
++      guint32 accept_hr = ft_engine_accept (frame, FTE4800_RAW_WIDTH,
++                                            FTE4800_RAW_HEIGHT, 4);
++      if (accept_hr != 0)
++        {
++          fp_warn ("FocalTech engine rejected enrollment capture: 0x%08x",
++                   accept_hr);
++          GError *retry = fpi_device_retry_new_msg (
++            FP_DEVICE_RETRY_GENERAL,
++            "Fingerprint capture rejected. Reposition your finger and try again.");
++          fpi_device_enroll_progress (FP_DEVICE (self),
++                                      self->enroll_count, NULL, retry);
++
++          if (!fte4800_wait_finger_up (self, cancel, frame))
++            {
++              g_task_return_error_if_cancelled (task);
++              return;
++            }
++          continue;
++        }
++
++      gint update = ft_engine_enroll_update ();
++      if (update == 2)
++        {
++          fp_dbg ("FocalTech engine rejected enrollment sample");
++          GError *retry = fpi_device_retry_new_msg (
++            FP_DEVICE_RETRY_GENERAL,
++            "Fingerprint sample was too similar or unsuitable. Lift and try again.");
++          fpi_device_enroll_progress (FP_DEVICE (self),
++                                      self->enroll_count, NULL, retry);
++        }
++      else
++        {
++          self->enroll_count++;
++          fp_dbg ("Vendor enrollment sample %d/%d",
++                  self->enroll_count, FTE4800_ENROLL_STAGES);
++          fpi_device_enroll_progress (FP_DEVICE (self),
++                                      self->enroll_count, NULL, NULL);
++        }
++
++      if (update == 0)
++        {
++          if (!fte4800_wait_finger_up (self, cancel, frame))
++            {
++              g_task_return_error_if_cancelled (task);
++              return;
++            }
++          break;
++        }
++
++      if (!fte4800_wait_finger_up (self, cancel, frame))
++        {
++          g_task_return_error_if_cancelled (task);
++          return;
++        }
++    }
++
++  guint8 *vendor_template = NULL;
++  size_t vendor_template_len = 0;
++  if (ft_engine_enroll_commit (&vendor_template, &vendor_template_len) != 0 ||
++      !fte4800_set_print_template (ed->enroll_print,
++                                    vendor_template, vendor_template_len))
++    {
++      g_free (vendor_template);
++      g_task_return_new_error (
++        task, G_IO_ERROR, G_IO_ERROR_FAILED,
++        "FocalTech vendor enrollment could not be committed");
++      return;
++    }
++
++  g_free (vendor_template);
++  g_task_return_boolean (task, TRUE);
++}
++
++static void
++fte4800_enroll_done (GObject *src, GAsyncResult *res, gpointer task_data)
++{
++  FpDevice   *dev = FP_DEVICE (src);
++  EnrollData *ed  = task_data;
++  GError     *err = NULL;
++
++  if (!g_task_propagate_boolean (G_TASK (res), &err))
++    fpi_device_enroll_complete (dev, NULL, err);
++  else
++    {
++      fp_info ("Enrollment complete using native FocalTech vendor template");
++      fpi_device_enroll_complete (dev, g_object_ref (ed->enroll_print), NULL);
++    }
++
++  g_object_unref (ed->enroll_print);
++  g_free (ed);
++}
++
++static void
++fte4800_enroll (FpDevice *dev)
++{
++  FpiDeviceFte4800 *self = FPI_DEVICE_FTE4800 (dev);
++  FpPrint *enroll_print = NULL;
++
++  fpi_device_get_enroll_data (dev, &enroll_print);
++
++  self->enroll_count = 0;
++
++  EnrollData *ed = g_new0 (EnrollData, 1);
++  ed->self = self;
++  ed->enroll_print = g_object_ref (enroll_print);
++
++  GTask *task = g_task_new (dev, fpi_device_get_cancellable (dev),
++                            fte4800_enroll_done, ed);
++  g_task_set_task_data (task, ed, NULL);
++  g_task_run_in_thread (task, fte4800_enroll_thread);
++  g_object_unref (task);
++}
++
++/* --------------------------------------------------------------------------
++ * Custom Verify
++ * -------------------------------------------------------------------------- */
++typedef struct {
++  FpiDeviceFte4800 *self;
++  FpPrint          *verify_print;
++} VerifyData;
++
++static void
++fte4800_verify_thread (GTask *task, gpointer src,
++                       gpointer task_data, GCancellable *cancel)
++{
++  VerifyData *vd = task_data;
++  FpiDeviceFte4800 *self = vd->self;
++  guint8 frame[FTE4800_RAW_PIXELS];
++  gsize template_len = 0;
++  g_autofree guint8 *vendor_template =
++    fte4800_get_print_template (vd->verify_print, &template_len);
++
++  if (!vendor_template)
++    {
++      g_task_return_new_error (
++        task, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
++        "Stored print is not an FTE4800 vendor template");
++      return;
++    }
++
++  if (g_task_return_error_if_cancelled (task))
++    return;
++
++  fte4800_hw_reset (self);
++  fpi_device_report_finger_status (
++    FP_DEVICE (self), FP_FINGER_STATUS_NONE | FP_FINGER_STATUS_NEEDED);
++
++  if (!fte4800_wait_finger_down (self, cancel, frame))
++    {
++      g_task_return_error_if_cancelled (task);
++      return;
++    }
++
++  fpi_device_report_finger_status (
++    FP_DEVICE (self), FP_FINGER_STATUS_PRESENT);
++
++  guint32 accept_hr = ft_engine_accept (frame, FTE4800_RAW_WIDTH,
++                                         FTE4800_RAW_HEIGHT, 1);
++  if (accept_hr != 0)
++    {
++      fp_warn ("FocalTech engine rejected verification capture: 0x%08x",
++               accept_hr);
++      if (accept_hr == 0x80098008U) /* WINBIO_E_BAD_CAPTURE */
++        {
++          g_task_return_error (
++            task, fpi_device_retry_new_msg (
++              FP_DEVICE_RETRY_GENERAL,
++              "Scan quality is too low. Reposition your finger and try again."));
++          return;
++        }
++      g_task_return_new_error (
++        task, G_IO_ERROR, G_IO_ERROR_FAILED,
++        "Fingerprint capture rejected by FocalTech engine");
++      return;
++    }
++
++  gboolean match = ft_engine_verify (vendor_template, template_len);
++  /* Verification finishes once the matcher has a result. Waiting for release
++   * here can let the PAM timeout discard an already successful match. The
++   * next verify resets the sensor before capturing a fresh frame. */
++  g_task_return_boolean (task, match);
++}
++
++static void
++fte4800_verify_done (GObject *src, GAsyncResult *res, gpointer task_data)
++{
++  FpDevice   *dev = FP_DEVICE (src);
++  VerifyData *vd  = task_data;
++  GError     *err = NULL;
++  gboolean match = g_task_propagate_boolean (G_TASK (res), &err);
++
++  if (err && err->domain == FP_DEVICE_RETRY)
++    {
++      fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL, err);
++      fpi_device_verify_complete (dev, NULL);
++    }
++  else if (err)
++    fpi_device_verify_complete (dev, err);
++  else
++    {
++      fp_info ("Verify %s via native FocalTech vendor engine",
++               match ? "MATCH" : "NO-MATCH");
++      fpi_device_verify_report (
++        dev, match ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL, NULL, NULL);
++      fpi_device_verify_complete (dev, NULL);
++    }
++
++  g_object_unref (vd->verify_print);
++  g_free (vd);
++}
++
++static void
++fte4800_verify (FpDevice *dev)
++{
++  FpPrint *print = NULL;
++  fpi_device_get_verify_data (dev, &print);
++
++  VerifyData *vd = g_new0 (VerifyData, 1);
++  vd->self = FPI_DEVICE_FTE4800 (dev);
++  vd->verify_print = g_object_ref (print);
++
++  GTask *task = g_task_new (dev, fpi_device_get_cancellable (dev),
++                            fte4800_verify_done, vd);
++  g_task_set_task_data (task, vd, NULL);
++  g_task_run_in_thread (task, fte4800_verify_thread);
++  g_object_unref (task);
++}
++
++/* --------------------------------------------------------------------------
++ * GObject lifecycle
++ * -------------------------------------------------------------------------- */
++static void
++fpi_device_fte4800_init (FpiDeviceFte4800 *self)
++{
++  self->spi_fd      = -1;
++  self->deactivating = FALSE;
++}
++
++static void
++fpi_device_fte4800_finalize (GObject *obj)
++{
++  FpiDeviceFte4800 *self = FPI_DEVICE_FTE4800 (obj);
++
++  if (self->spi_fd >= 0)
++    {
++      close (self->spi_fd);
++      self->spi_fd = -1;
++    }
++  G_OBJECT_CLASS (fpi_device_fte4800_parent_class)->finalize (obj);
++}
++
++static void
++fpi_device_fte4800_class_init (FpiDeviceFte4800Class *klass)
++{
++  GObjectClass       *obj_class = G_OBJECT_CLASS (klass);
++  FpDeviceClass      *dev_class = FP_DEVICE_CLASS (klass);
++  FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (klass);
++
++  obj_class->finalize = fpi_device_fte4800_finalize;
++
++  dev_class->id             = "fte4800";
++  dev_class->full_name      = "FocalTech FTE4800 / FT9368 Fingerprint Sensor";
++  dev_class->type           = FP_DEVICE_TYPE_UDEV;
++  dev_class->id_table       = fte4800_id_table;
++  dev_class->scan_type      = FP_SCAN_TYPE_PRESS;
++  dev_class->nr_enroll_stages = FTE4800_ENROLL_STAGES;
++
++  /* Driver-specific matching for the FT9368's 64x80 image geometry.
++   * Identify is intentionally NOT registered here: fprintd uses
++   * FP_DEVICE_FEATURE_IDENTIFY to run a silent duplicate-check before
++   * enrollment.  Advertising this feature causes fprintd to silently wait
++   * for a touch+lift cycle before showing any "Place your finger" prompt,
++   * making the enrollment UI appear frozen.  Verify is sufficient for the
++   * normal PAM/polkit use-case.
++   *
++   * IMPORTANT: FpImageDevice base class sets identify = fp_image_device_start_capture_action
++   * and calls fpi_device_class_auto_initialize_features() which sets FP_DEVICE_FEATURE_IDENTIFY
++   * because identify is non-NULL at that point.  We must explicitly NULL the vfunc AND
++   * clear the feature bit here (our class_init runs after the parent's). */
++  dev_class->enroll   = fte4800_enroll;
++  dev_class->verify   = fte4800_verify;
++  dev_class->identify = NULL;    /* clear parent's fp_image_device_start_capture_action */
++  dev_class->capture  = NULL;    /* not used — we run our own thread */
++  dev_class->features &= ~(FP_DEVICE_FEATURE_IDENTIFY | FP_DEVICE_FEATURE_CAPTURE);
++
++  /* The FT9368 is a passive always-on sensor; there is no thermal throttle
++   * risk during the 15-stage enrollment loop.  Without this flag the default
++   * libfprint temperature model fires after ~20 s and returns
++   * FP_DEVICE_ERROR_BUSY ("enroll-disconnected"). */
++  dev_class->temp_hot_seconds = -1;
++
++  /* Standard image-device plumbing for open/close/activate/deactivate. */
++  img_class->img_open     = fte4800_open;
++  img_class->img_close    = fte4800_close;
++  img_class->activate     = fte4800_activate;
++  img_class->deactivate   = fte4800_deactivate;
++  img_class->change_state = fte4800_change_state;
++  img_class->img_width    = FTE4800_RAW_WIDTH;
++  img_class->img_height   = FTE4800_RAW_HEIGHT;
++}
+diff --git a/libfprint/drivers/fte4800.h b/libfprint/drivers/fte4800.h
+new file mode 100644
+index 00000000..73f6555d
+--- /dev/null
++++ b/libfprint/drivers/fte4800.h
+@@ -0,0 +1,48 @@
++/*
++ * FocalTech FTE4800 / FT9368 Driver for libfprint
++ * Copyright (C) 2026
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#pragma once
++
++#include <config.h>
++
++#ifndef HAVE_UDEV
++#error "fte4800 requires udev"
++#endif
++
++#include <fp-device.h>
++#include <fpi-device.h>
++
++#define FTE4800_RAW_WIDTH      64
++#define FTE4800_RAW_HEIGHT     80
++#define FTE4800_RAW_PIXELS     (FTE4800_RAW_WIDTH * FTE4800_RAW_HEIGHT) /* 5120 */
++
++#define FTE4800_SCALED_WIDTH   (FTE4800_RAW_WIDTH * 2)  /* 128 */
++#define FTE4800_SCALED_HEIGHT  (FTE4800_RAW_HEIGHT * 2) /* 160 */
++
++#define FTE4800_IOCTL_RESET    0x8086
++
++static const FpIdEntry fte4800_id_table[] = {
++  {
++    .udev_types = FPI_DEVICE_UDEV_SUBTYPE_MISC,
++    .spi_acpi_id = "focal_moh_spi",
++  },
++  {
++    .udev_types = 0,
++  }
++};
+diff --git a/libfprint/drivers/vendor-engine.c b/libfprint/drivers/vendor-engine.c
+new file mode 100644
+index 00000000..f6510e11
+--- /dev/null
++++ b/libfprint/drivers/vendor-engine.c
+@@ -0,0 +1,663 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++// loader.c — native in-process loader for ftWbioEngineAdapter.dll, NO WINE.
++// Maps the PE, sets up a fake x64 TEB in %gs, runs static-CRT DllMain, then
++// calls WbioQueryEngineInterface + Attach + AcceptSampleData on a real print.
++//
++// Build: gcc -O0 -g -o loader loader.c
++// x86-64 Linux: glibc TLS uses %fs, so %gs is free for the Windows TEB.
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include <stdarg.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/mman.h>
++#include <sys/syscall.h>
++#include <asm/prctl.h>
++#include <pthread.h>
++
++typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
++#define MS __attribute__((ms_abi))
++#define DLL_PROCESS_ATTACH 1
++
++static u8 *g_image;          // mapped image base
++static u64 g_imagebase;      // preferred base 0x180000000
++static const char *g_dllpath;
++
++// ---------- tiny PE structures (only fields we use) ----------
++#pragma pack(push,1)
++typedef struct { u16 e_magic; u8 pad[58]; u32 e_lfanew; } DOS;
++typedef struct {
++  u32 Signature; u16 Machine, NumSecs; u32 TimeStamp, PtrSym, NumSym; u16 OptSize, Chars;
++} FILEHDR;
++typedef struct { u8 Name[8]; u32 VSize, VAddr, RawSize, RawPtr; u32 pad[3]; u16 pad2[2]; u32 Chars; } SEC;
++#pragma pack(pop)
++
++static u8 *g_file; static long g_filelen;
++static u32 f32(u64 o){ return *(u32*)(g_file+o); }
++static u64 f64(u64 o){ return *(u64*)(g_file+o); }
++static u16 f16(u64 o){ return *(u16*)(g_file+o); }
++
++// ---------- fake TEB / gs ----------
++static u8 g_teb[0x2000];
++static u8 g_peb[0x1000];
++static void *g_tls_array[64];
++static u8  g_tls_block[0x2000];
++
++static int set_gs(void *base){ return syscall(SYS_arch_prctl, ARCH_SET_GS, base); }
++
++/* The vendor CRT uses the Windows TEB stack bounds from %gs:+0x08/+0x10
++ * for __chkstk probing. Those bounds must describe the *current Linux thread*
++ * stack, especially when the engine is called from a GLib worker thread.
++ * Keeping the old dummy bounds causes the vendor's stack probe to fault at
++ * 0x1800493f8 before VerifyFeatureSet can execute. */
++static int arm_teb_for_current_thread(void)
++{
++  pthread_attr_t attr;
++  void *stack_base = NULL;
++  size_t stack_size = 0;
++  size_t guard_size = 0;
++
++  if (pthread_getattr_np(pthread_self(), &attr) == 0)
++    {
++      (void) pthread_attr_getstack(&attr, &stack_base, &stack_size);
++      (void) pthread_attr_getguardsize(&attr, &guard_size);
++      pthread_attr_destroy(&attr);
++
++      if (stack_base && stack_size)
++        {
++          uintptr_t low = (uintptr_t) stack_base + guard_size;
++          uintptr_t high = (uintptr_t) stack_base + stack_size;
++          *(u64*)(g_teb + 0x08) = high; /* NtTib.StackBase */
++          *(u64*)(g_teb + 0x10) = low;  /* NtTib.StackLimit */
++        }
++    }
++
++  return set_gs(g_teb);
++}
++
++// ---------- import shim table ----------
++typedef struct { const char *name; void *fn; } Shim;
++static Shim shims[128]; static int nshims;
++static void reg(const char*n, void*f){ if(nshims>=(int)(sizeof shims/sizeof*shims)){fprintf(stderr,"ft_engine: shim table full (%d) — raise shims[]\n",nshims);abort();} shims[nshims].name=n; shims[nshims].fn=f; nshims++; }
++static void* find_shim(const char*n){ for(int i=0;i<nshims;i++) if(!strcmp(shims[i].name,n)) return shims[i].fn; return 0; }
++
++// ================= SHIMS (all MS ABI) =================
++
++// ---------- BCrypt SHA-256 shim (real hashing, no crypto bypass) ----------
++#define STATUS_SUCCESS 0u
++#define STATUS_INVALID_PARAMETER 0xC000000Du
++#define STATUS_BUFFER_TOO_SMALL 0xC0000023u
++#define ERROR_FILE_NOT_FOUND 2u
++
++typedef struct {
++  u32 h[8];
++  u64 bits;
++  u8 buf[64];
++  u32 used;
++} Sha256Ctx;
++
++static u32 rotr32(u32 x,u32 n){ return (x>>n)|(x<<(32-n)); }
++static u32 ch32(u32 x,u32 y,u32 z){ return (x&y)^(~x&z); }
++static u32 maj32(u32 x,u32 y,u32 z){ return (x&y)^(x&z)^(y&z); }
++static u32 s0_256(u32 x){ return rotr32(x,2)^rotr32(x,13)^rotr32(x,22); }
++static u32 s1_256(u32 x){ return rotr32(x,6)^rotr32(x,11)^rotr32(x,25); }
++static u32 g0_256(u32 x){ return rotr32(x,7)^rotr32(x,18)^(x>>3); }
++static u32 g1_256(u32 x){ return rotr32(x,17)^rotr32(x,19)^(x>>10); }
++
++static const u32 sha256_k[64]={
++  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
++  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
++  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
++  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
++  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
++  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
++  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
++  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
++};
++
++static void sha256_init(Sha256Ctx*c){
++  static const u32 iv[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
++  memcpy(c->h,iv,sizeof iv); c->bits=0; c->used=0;
++}
++static void sha256_block(Sha256Ctx*c,const u8*b){
++  u32 w[64],a,bb,cc,d,e,f,g,h1;
++  for(int i=0;i<16;i++) w[i]=((u32)b[i*4]<<24)|((u32)b[i*4+1]<<16)|((u32)b[i*4+2]<<8)|b[i*4+3];
++  for(int i=16;i<64;i++) w[i]=g1_256(w[i-2])+w[i-7]+g0_256(w[i-15])+w[i-16];
++  a=c->h[0]; bb=c->h[1]; cc=c->h[2]; d=c->h[3]; e=c->h[4]; f=c->h[5]; g=c->h[6]; h1=c->h[7];
++  for(int i=0;i<64;i++){
++    u32 t1=h1+s1_256(e)+ch32(e,f,g)+sha256_k[i]+w[i];
++    u32 t2=s0_256(a)+maj32(a,bb,cc);
++    h1=g; g=f; f=e; e=d+t1; d=cc; cc=bb; bb=a; a=t1+t2;
++  }
++  c->h[0]+=a; c->h[1]+=bb; c->h[2]+=cc; c->h[3]+=d; c->h[4]+=e; c->h[5]+=f; c->h[6]+=g; c->h[7]+=h1;
++}
++static void sha256_update(Sha256Ctx*c,const u8*p,u32 n){
++  c->bits += (u64)n*8;
++  while(n){
++    u32 take=64-c->used; if(take>n) take=n;
++    memcpy(c->buf+c->used,p,take); c->used+=take; p+=take; n-=take;
++    if(c->used==64){ sha256_block(c,c->buf); c->used=0; }
++  }
++}
++static void sha256_final(Sha256Ctx*c,u8*out){
++  u32 used=c->used; c->buf[used++]=0x80;
++  if(used>56){ memset(c->buf+used,0,64-used); sha256_block(c,c->buf); used=0; }
++  memset(c->buf+used,0,56-used);
++  for(int i=0;i<8;i++) c->buf[56+i]=(u8)(c->bits>>(56-8*i));
++  sha256_block(c,c->buf);
++  for(int i=0;i<8;i++){ out[4*i]=(u8)(c->h[i]>>24); out[4*i+1]=(u8)(c->h[i]>>16); out[4*i+2]=(u8)(c->h[i]>>8); out[4*i+3]=(u8)c->h[i]; }
++}
++static int w16eq(const u16*s,const char*ascii){
++  int i=0; for(;ascii[i];i++) if(s[i]!=(u8)ascii[i]) return 0; return s[i]==0;
++}
++static int g_sha_algorithm;
++static u32 MS sh_BCryptOpenAlgorithmProvider(void**ph,const u16*algid,const u16*impl,u32 fl){
++  if(!ph || !algid || !w16eq(algid,"SHA256")) return STATUS_INVALID_PARAMETER;
++  *ph=&g_sha_algorithm; return STATUS_SUCCESS;
++}
++static u32 MS sh_BCryptCloseAlgorithmProvider(void*h,u32 fl){ return h==&g_sha_algorithm?STATUS_SUCCESS:STATUS_INVALID_PARAMETER; }
++static u32 MS sh_BCryptCreateHash(void*h,void**ph,u8*ho,u32 cho,u8*sec,u32 csec,u32 fl){
++  if(h!=&g_sha_algorithm || !ph) return STATUS_INVALID_PARAMETER;
++  Sha256Ctx*c=malloc(sizeof(*c)); if(!c) return 0xC0000017u; sha256_init(c); *ph=c; return STATUS_SUCCESS;
++}
++static u32 MS sh_BCryptHashData(void*h,u8*in,u32 cb,u32 fl){
++  if(!h || (!in && cb)) return STATUS_INVALID_PARAMETER;
++  sha256_update((Sha256Ctx*)h,in,cb);
++  return STATUS_SUCCESS;
++}
++static u32 MS sh_BCryptDestroyHash(void*h){ if(!h) return STATUS_INVALID_PARAMETER; free(h); return STATUS_SUCCESS; }
++static u32 MS sh_BCryptFinishHash(void*h,u8*out,u32 cb,u32 fl){
++  if(!h || !out || cb<32) return cb<32?STATUS_BUFFER_TOO_SMALL:STATUS_INVALID_PARAMETER;
++  Sha256Ctx c=*(Sha256Ctx*)h; sha256_final(&c,out); return STATUS_SUCCESS;
++}
++static u32 MS sh_BCryptGetProperty(void*h,const u16*prop,u8*out,u32 cb,u32*res,u32 fl){
++  if(!prop || !res) return STATUS_INVALID_PARAMETER;
++  u32 v=0;
++  if(w16eq(prop,"HashDigestLength")) v=32;
++  else if(w16eq(prop,"ObjectLength")) v=sizeof(Sha256Ctx);
++  else if(w16eq(prop,"BlockLength")) v=64;
++  else return 0xC0000059u;
++  *res=4; if(!out || cb<4) return STATUS_BUFFER_TOO_SMALL; *(u32*)out=v; return STATUS_SUCCESS;
++}
++
++// ---------- ADVAPI32 registry shim: report absent vendor configuration ----------
++static u32 MS sh_RegOpenKeyExA(void*h,const char*sub,u32 opt,u32 access,void*out){ if(out)*(u64*)out=0; return ERROR_FILE_NOT_FOUND; }
++static u32 MS sh_RegQueryValueExA(void*h,const char*name,u32*r0,u32*r1,u8*data,u32*pcb){ return ERROR_FILE_NOT_FOUND; }
++static u32 MS sh_RegCloseKey(void*h){ return 0; }
++
++static u32 g_lasterr=0;
++static void MS sh_SetLastError(u32 e){ g_lasterr=e; }
++static u32  MS sh_GetLastError(void){ return g_lasterr; }
++
++static void* MS sh_GetProcessHeap(void){ return (void*)0x100; }
++static void* MS sh_HeapAlloc(void*h,u32 flags,u64 size){ void*p=malloc(size?size:1); if(p&&(flags&8)) memset(p,0,size); return p; }
++static int   MS sh_HeapFree(void*h,u32 f,void*p){ free(p); return 1; }
++static void* MS sh_HeapReAlloc(void*h,u32 f,void*p,u64 s){ return realloc(p,s); }
++static u64   MS sh_HeapSize(void*h,u32 f,void*p){ return 0; }
++static int   MS sh_HeapValidate(void*h,u32 f,void*p){ return 1; }
++static int   MS sh_HeapQueryInformation(void*h,int c,void*b,u64 l,u64*r){ return 0; }
++
++static void MS sh_InitCS(void*p){ }
++static u32  MS sh_InitCSSpin(void*p,u32 s){ return 1; }
++static u32  MS sh_InitCSEx(void*p,u32 s,u32 flags){ return 1; }
++static void MS sh_InitConditionVariable(void*p){ memset(p,0,8); }
++static int   MS sh_WakeAllConditionVariable(void*p){ return 1; }
++static int   MS sh_SleepConditionVariableCS(void*cv,void*cs,u32 ms,u32 flags){ return 1; }
++static void MS sh_EnterCS(void*p){ }
++static void MS sh_LeaveCS(void*p){ }
++static void MS sh_DeleteCS(void*p){ }
++static void MS sh_InitSList(void*p){ memset(p,0,16); }
++static void* MS sh_FlushSList(void*p){ return 0; }
++
++// TLS
++static u32 g_tls_next=1; static void* g_tls_vals[1088];
++static u32 g_fls_next=1; static void* g_fls_vals[1088];
++static u32  MS sh_FlsAlloc(void(*cb)(void*)){ return g_fls_next++; }
++static int  MS sh_FlsFree(u32 i){ return 1; }
++static void* MS sh_FlsGetValue(u32 i){ g_lasterr=0; return i<1088?g_fls_vals[i]:0; }
++static int  MS sh_FlsSetValue(u32 i,void*v){ if(i<1088)g_fls_vals[i]=v; return 1; }
++static u32  MS sh_TlsAlloc(void){ return g_tls_next++; }
++static int  MS sh_TlsFree(u32 i){ return 1; }
++static void* MS sh_TlsGetValue(u32 i){ g_lasterr=0; return i<1088?g_tls_vals[i]:0; }
++static int  MS sh_TlsSetValue(u32 i,void*v){ if(i<1088) g_tls_vals[i]=v; return 1; }
++
++// process/thread/module
++static void* MS sh_GetCurrentProcess(void){ return (void*)-1; }
++static u32  MS sh_GetCurrentProcessId(void){ return 1234; }
++static u32  MS sh_GetCurrentThreadId(void){ return 5678; }
++static void* MS sh_GetModuleHandleW(void*n){ return (void*)g_image; }
++static void* MS sh_GetModuleHandleA(void*n){ return (void*)g_image; }
++static int  MS sh_GetModuleHandleExW(u32 f,void*n,void**h){ if(h)*h=(void*)g_image; return 1; }
++static u32  MS sh_GetModuleFileNameA(void*m,char*b,u32 n){ strncpy(b,g_dllpath,n); return strlen(g_dllpath); }
++static u32  MS sh_GetModuleFileNameW(void*m,u16*b,u32 n){ u32 i=0; for(;g_dllpath[i]&&i<n-1;i++) b[i]=g_dllpath[i]; b[i]=0; return i; }
++static void* MS sh_LoadLibraryExW(void*n,void*h,u32 f){ return (void*)0x1000; }
++static int  MS sh_FreeLibrary(void*h){ return 1; }
++static void* MS sh_GetProcAddress(void*h,const char*n){ if((u64)n>>16==0) return 0; /*by ordinal*/ return find_shim(n); }
++
++// console/file → route engine logs to stderr so we SEE its [Engine] output
++static void* MS sh_GetStdHandle(u32 n){ return (void*)(u64)(n?n:1); }
++static int  MS sh_SetStdHandle(u32 n,void*h){ return 1; }
++static u32  MS sh_GetFileType(void*h){ return 2; /*CHAR*/ }
++static int  MS sh_GetConsoleMode(void*h,u32*m){ if(m)*m=0; return 1; }
++static u32  MS sh_GetConsoleCP(void){ return 437; }
++static int  MS sh_WriteFile(void*h,const void*b,u32 n,u32*wr,void*o){ fwrite(b,1,n,stderr); if(wr)*wr=n; return 1; }
++static int  MS sh_WriteConsoleW(void*h,const u16*b,u32 n,u32*wr,void*r){ for(u32 i=0;i<n;i++) fputc(b[i]&0xff,stderr); if(wr)*wr=n; return 1; }
++static void MS sh_OutputDebugStringA(const char*s){ fprintf(stderr,"%s",s?s:""); }
++static void MS sh_OutputDebugStringW(const u16*s){ if(s)for(;*s;s++) fputc(*s&0xff,stderr); }
++static int  MS sh_FlushFileBuffers(void*h){ return 1; }
++static void* MS sh_CreateFileW(void*n,u32 a,u32 s,void*sa,u32 c,u32 fl,void*t){ g_lasterr=2; return (void*)-1; } // config absent → graceful
++static int  MS sh_SetFilePointerEx(void*h,long long d,void*np,u32 m){ return 0; }
++static int  MS sh_CloseHandle(void*h){ return 1; }
++static void* MS sh_FindFirstFileExA(void*n,int i,void*d,int o,void*s,u32 f){ return (void*)-1; }
++static int  MS sh_FindNextFileA(void*h,void*d){ return 0; }
++static void* MS sh_FindFirstFileExW(void*n,int i,void*d,int o,void*s,u32 f){ return (void*)-1; }
++static int  MS sh_FindNextFileW(void*h,void*d){ return 0; }
++static int  MS sh_CSpecificHandler(void*a,void*b,void*c,void*d){ return 0; }
++static int  MS sh_FindClose(void*h){ return 1; }
++static u32  MS sh_GetSystemDirectoryA(char*b,u32 n){ strncpy(b,"C:\\Windows\\System32",n); return 19; }
++
++// sync / events → the engine's global lock
++static void* MS sh_CreateEventW(void*sa,int man,int init,void*name){ return (void*)0x2000; }
++static int  MS sh_SetEvent(void*h){ return 1; }
++static int  MS sh_ResetEvent(void*h){ return 1; }
++static u32  MS sh_WaitForSingleObject(void*h,u32 ms){ return 0; /*WAIT_OBJECT_0*/ }
++static u32  MS sh_WaitForSingleObjectEx(void*h,u32 ms,int a){ return 0; }
++static void* MS sh_CreateThread(void*sa,u64 st,void*fn,void*arg,u32 fl,u32*id){ if(id)*id=4321; return (void*)0x3000; }
++static int  MS sh_DeviceIoControl(void*h,u32 c,void*ib,u32 il,void*ob,u32 ol,u32*ret,void*ov){ return 0; }
++
++// locale / codepage (ucrt init)
++static u32  MS sh_GetACP(void){ return 1252; }
++static u32  MS sh_GetOEMCP(void){ return 437; }
++static int  MS sh_GetCPInfo(u32 cp,void*info){ if(info){ u8*p=info; *(u32*)p=1; p[4]=0; p[5]=0; } return 1; }
++static int  MS sh_IsValidCodePage(u32 cp){ return 1; }
++static int  MS sh_MultiByteToWideChar(u32 cp,u32 f,const char*mb,int mbc,u16*wc,int wcc){
++  if(mbc<0) mbc=strlen(mb)+1;
++  if(wcc==0) return mbc;
++  int n=mbc<wcc?mbc:wcc;
++  for(int i=0;i<n;i++) wc[i]=(u8)mb[i];
++  return n; }
++static int  MS sh_WideCharToMultiByte(u32 cp,u32 f,const u16*wc,int wcc,char*mb,int mbc,void*d,void*u){
++  if(wcc<0){ wcc=0; while(wc[wcc]) wcc++; wcc++; } if(mbc==0) return wcc; int n=wcc<mbc?wcc:mbc; for(int i=0;i<n;i++) mb[i]=(char)wc[i]; return n; }
++static int  MS sh_LCMapStringW(u32 l,u32 f,const u16*s,int sc,u16*d,int dc){ if(dc==0) return sc; int n=sc<dc?sc:dc; for(int i=0;i<n;i++) d[i]=s[i]; return n; }
++static int  MS sh_GetStringTypeW(u32 t,const u16*s,int c,u16*out){ for(int i=0;i<c;i++) out[i]=0; return 1; }
++
++// misc / version / cpu
++static void MS sh_GetSystemInfo(void*p){ memset(p,0,64); u8*b=p; *(u32*)(b+0)=9; *(u32*)(b+4)=4096; }
++static void MS sh_GetSystemTimeAsFileTime(u64*ft){ static u64 t=0x01d0000000000000ULL; *ft=(t+=100000); }
++static u32  MS sh_GetTickCount(void){ static u32 t=1000; return (t+=5); }
++static int  MS sh_QueryPerformanceCounter(u64*c){ static u64 t=0; *c=(t+=1000); return 1; }
++static int  MS sh_IsDebuggerPresent(void){ return 0; }
++static int  MS sh_IsProcessorFeaturePresent(u32 f){ return 1; }
++static void* MS sh_EncodePointer(void*p){ return p; }
++static void* MS sh_DecodePointer(void*p){ return p; }
++static u64  MS sh_VerSetConditionMask(u64 m,u32 t,u8 c){ return m; }
++static int  MS sh_VerifyVersionInfoA(void*vi,u32 tm,u64 cm){ return 1; }
++static char g_cmd[]="loader"; static u16 g_cmdw[]={'l','o','a','d','e','r',0};
++static char* MS sh_GetCommandLineA(void){ return g_cmd; }
++static u16*  MS sh_GetCommandLineW(void){ return g_cmdw; }
++static void MS sh_GetStartupInfoW(void*si){ memset(si,0,104); *(u32*)si=104; }
++static u16 g_env[2]={0,0};
++static u16* MS sh_GetEnvironmentStringsW(void){ return g_env; }
++static int  MS sh_FreeEnvironmentStringsW(void*p){ return 1; }
++
++// exception/unwind (only hit if the engine throws — hope not)
++static void MS sh_RtlCaptureContext(void*ctx){ memset(ctx,0,1232); }
++static void* MS sh_RtlLookupFunctionEntry(u64 pc,u64*base,void*hist){ if(base)*base=g_imagebase; return 0; }
++static void* MS sh_RtlVirtualUnwind(u32 t,u64 b,u64 pc,void*fe,void*ctx,void**hd,u64*est,void*ctxp){ return 0; }
++static void MS sh_RtlUnwindEx(void*a,void*b,void*c,void*d,void*e,void*f){ }
++static void* MS sh_RtlPcToFileHeader(void*pc,void**base){ if(base)*base=(void*)g_image; return (void*)g_image; }
++static void* MS sh_SetUnhandledExceptionFilter(void*f){ return 0; }
++static u32  MS sh_UnhandledExceptionFilter(void*p){ return 1; }
++static void MS sh_RaiseException(u32 code,u32 fl,u32 n,void*a){ fprintf(stderr,"[!] RaiseException code=%#x\n",code); }
++static void MS sh_TerminateProcess(void*h,u32 c){ fprintf(stderr,"[!] TerminateProcess(%u)\n",c); }
++static void MS sh_ExitProcess(u32 c){ fprintf(stderr,"[!] ExitProcess(%u)\n",c); }
++
++static void register_shims(void){
++#define R(n) reg(#n, (void*)sh_##n)
++  R(BCryptOpenAlgorithmProvider);R(BCryptCreateHash);R(BCryptHashData);R(BCryptDestroyHash);R(BCryptCloseAlgorithmProvider);R(BCryptFinishHash);R(BCryptGetProperty);
++  R(RegQueryValueExA);R(RegOpenKeyExA);R(RegCloseKey);
++  R(SetLastError);R(GetLastError);R(GetProcessHeap);R(HeapAlloc);R(HeapFree);R(HeapReAlloc);
++  R(HeapSize);R(HeapValidate);R(HeapQueryInformation);
++  reg("InitializeCriticalSection",sh_InitCS);reg("InitializeCriticalSectionAndSpinCount",sh_InitCSSpin);reg("InitializeCriticalSectionEx",sh_InitCSEx);
++  reg("InitializeConditionVariable",sh_InitConditionVariable);reg("WakeAllConditionVariable",sh_WakeAllConditionVariable);reg("SleepConditionVariableCS",sh_SleepConditionVariableCS);
++  reg("EnterCriticalSection",sh_EnterCS);reg("LeaveCriticalSection",sh_LeaveCS);reg("DeleteCriticalSection",sh_DeleteCS);
++  reg("InitializeSListHead",sh_InitSList);reg("InterlockedFlushSList",sh_FlushSList);
++  R(TlsAlloc);R(TlsFree);R(TlsGetValue);R(TlsSetValue);
++  R(FlsAlloc);R(FlsFree);R(FlsGetValue);R(FlsSetValue);
++  R(GetCurrentProcess);R(GetCurrentProcessId);R(GetCurrentThreadId);
++  R(GetModuleHandleW);R(GetModuleHandleA);R(GetModuleHandleExW);R(GetModuleFileNameA);R(GetModuleFileNameW);
++  R(LoadLibraryExW);R(FreeLibrary);R(GetProcAddress);
++  R(GetStdHandle);R(SetStdHandle);R(GetFileType);R(GetConsoleMode);R(GetConsoleCP);
++  R(WriteFile);R(WriteConsoleW);R(OutputDebugStringA);R(OutputDebugStringW);R(FlushFileBuffers);
++  R(CreateFileW);R(SetFilePointerEx);R(CloseHandle);R(FindFirstFileExA);R(FindNextFileA);R(FindFirstFileExW);R(FindNextFileW);R(FindClose);R(GetSystemDirectoryA);
++  R(CreateEventW);R(SetEvent);R(ResetEvent);R(WaitForSingleObject);R(WaitForSingleObjectEx);R(CreateThread);R(DeviceIoControl);
++  R(GetACP);R(GetOEMCP);R(GetCPInfo);R(IsValidCodePage);R(MultiByteToWideChar);R(WideCharToMultiByte);R(LCMapStringW);R(GetStringTypeW);
++  R(GetSystemInfo);R(GetSystemTimeAsFileTime);R(GetTickCount);R(QueryPerformanceCounter);R(IsDebuggerPresent);R(IsProcessorFeaturePresent);
++  R(EncodePointer);R(DecodePointer);R(VerSetConditionMask);R(VerifyVersionInfoA);
++  R(GetCommandLineA);R(GetCommandLineW);R(GetStartupInfoW);R(GetEnvironmentStringsW);R(FreeEnvironmentStringsW);
++  R(RtlCaptureContext);R(RtlLookupFunctionEntry);R(RtlVirtualUnwind);R(RtlUnwindEx);R(RtlPcToFileHeader);reg("__C_specific_handler",sh_CSpecificHandler);
++  R(SetUnhandledExceptionFilter);R(UnhandledExceptionFilter);R(RaiseException);R(TerminateProcess);R(ExitProcess);
++#undef R
++}
++
++// ================= PE LOADER =================
++static int load_pe(void){
++  int fd=open(g_dllpath,O_RDONLY); if(fd<0){perror("open");return -1;}
++  g_filelen=lseek(fd,0,SEEK_END); lseek(fd,0,SEEK_SET);
++  g_file=malloc(g_filelen); read(fd,g_file,g_filelen); close(fd);
++
++  u32 e=f32(0x3c);
++  g_imagebase=f64(e+24+24);
++  u32 sizeofimage=f32(e+24+56);
++  u32 entry=f32(e+24+16);
++  u16 nsec=f16(e+6);
++  u16 optsize=f16(e+20);
++  u64 sectbl=e+24+optsize;
++
++  u32 hdrsize=f32(e+24+60); // SizeOfHeaders
++
++  /* Prepare the fully-resolved image in a scratch buffer (writable, NOT
++   * executable), then map it back from an anonymous FILE (memfd) with per-section
++   * protections. This keeps code read+execute and data read+write, so no page is
++   * ever writable AND executable at once — which lets the engine run under
++   * fprintd's MemoryDenyWriteExecute=yes hardening (no systemd override needed).
++   * The DLL loads at its preferred base 0x180000000, so no relocations are
++   * required. */
++  u8 *img=calloc(1,sizeofimage);
++  if(!img){ perror("calloc"); return -1; }
++  memcpy(img,g_file,hdrsize);
++  for(int i=0;i<nsec;i++){
++    u64 s=sectbl+i*40;
++    u32 vaddr=f32(s+12), rawsize=f32(s+16), rawptr=f32(s+20);
++    memcpy(img+vaddr, g_file+rawptr, rawsize);
++  }
++
++  /* resolve kernel32 imports into the IAT within the scratch buffer */
++  u32 imprva=f32(e+24+112+8*1);
++  for(u64 d=imprva;;d+=20){
++    u32 orig=*(u32*)(img+d), namer=*(u32*)(img+d+12), fthunk=*(u32*)(img+d+16);
++    if(namer==0) break;
++    u64 rt=orig?orig:fthunk;
++    for(int j=0;;j++){
++      u64 ent=*(u64*)(img+rt+j*8);
++      if(!ent) break;
++      u64 *slot=(u64*)(img+fthunk+j*8);
++      if(ent>>63){ *slot=0; continue; } // by ordinal: none needed
++      const char*fn=(char*)(img+(ent&0x7fffffff)+2);
++      void*sh=find_shim(fn);
++      if(!sh) fprintf(stderr,"[loader] MISSING shim: %s\n",fn);
++      *slot=(u64)sh;
++    }
++  }
++
++  /* write the prepared image to an anonymous in-memory file */
++  int mfd=memfd_create("ftengine",MFD_CLOEXEC);
++  if(mfd<0){ perror("memfd_create"); free(img); return -1; }
++  ssize_t wr=write(mfd,img,sizeofimage);
++  free(img);
++  if(wr!=(ssize_t)sizeofimage){ perror("write memfd"); close(mfd); return -1; }
++
++  /* reserve the preferred base, then map each section from the file (W^X-safe) */
++  void *m=mmap((void*)g_imagebase,sizeofimage,PROT_NONE,
++               MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
++  if(m==MAP_FAILED || m!=(void*)g_imagebase){
++    fprintf(stderr,"[loader] reserve @%#lx failed (%p)\n",g_imagebase,m); close(mfd); return -1;
++  }
++  g_image=m;
++  u32 hdrmap=(hdrsize+0xfff)&~0xfffu;
++  if(mmap(g_image,hdrmap,PROT_READ,MAP_PRIVATE|MAP_FIXED,mfd,0)==MAP_FAILED){
++    perror("[loader] map headers"); close(mfd); return -1;
++  }
++  for(int i=0;i<nsec;i++){
++    u64 s=sectbl+i*40;
++    u32 vaddr=f32(s+12), vsize=f32(s+8), rawsize=f32(s+16), chars=f32(s+36);
++    u32 seglen=(vsize>rawsize?vsize:rawsize); seglen=(seglen+0xfff)&~0xfffu;
++    if(vaddr+seglen>sizeofimage) seglen=sizeofimage-vaddr;
++    if(!seglen) continue;
++    int prot=PROT_READ;
++    if(chars&0x20000000) prot|=PROT_EXEC;   // IMAGE_SCN_MEM_EXECUTE
++    if(chars&0x80000000) prot|=PROT_WRITE;  // IMAGE_SCN_MEM_WRITE
++    if(mmap(g_image+vaddr,seglen,prot,MAP_PRIVATE|MAP_FIXED,mfd,vaddr)==MAP_FAILED){
++      perror("[loader] map section"); close(mfd); return -1;
++    }
++  }
++  close(mfd);
++  fprintf(stderr,"[loader] file-backed image at %#lx (no W+X), entry RVA %#x\n",g_imagebase,entry);
++
++  // TLS setup (dir 9): copy template, wire teb->tls array
++  u32 tlsrva=f32(e+24+112+8*9);
++  if(tlsrva){
++    u64 start=*(u64*)(g_image+tlsrva);
++    u64 end=*(u64*)(g_image+tlsrva+8);
++    u64 idxaddr=*(u64*)(g_image+tlsrva+16);
++    u64 cbaddr=*(u64*)(g_image+tlsrva+24);
++    u64 tlen=end-start;
++    memset(g_tls_block,0,sizeof g_tls_block);
++    if(tlen) memcpy(g_tls_block,(void*)start,tlen);
++    g_tls_array[0]=g_tls_block;
++    if(idxaddr) *(u32*)idxaddr=0;
++    fprintf(stderr,"[loader] TLS template %lu bytes, callbacks@%#lx\n",tlen,cbaddr);
++    // run TLS callbacks
++    if(cbaddr){ for(u64*cb=(u64*)cbaddr; *cb; cb++){ void(MS *f)(void*,u32,void*)=(void*)*cb; f((void*)g_imagebase,DLL_PROCESS_ATTACH,0);} }
++  }
++
++  // fake TEB in %gs; stack bounds are refreshed from the current Linux thread
++  memset(g_teb,0,sizeof g_teb); memset(g_peb,0,sizeof g_peb);
++  *(u64*)(g_teb+0x30)=(u64)g_teb;            // NtTib.Self
++  *(u64*)(g_teb+0x58)=(u64)g_tls_array;      // ThreadLocalStoragePointer
++  *(u64*)(g_teb+0x60)=(u64)g_peb;            // PEB
++  if(arm_teb_for_current_thread()!=0){ perror("arch_prctl SET_GS"); return -1; }
++  fprintf(stderr,"[loader] TEB installed in %%gs\n");
++
++  // run entry point (DllMain via CRT startup)
++  int(MS *DllMain)(void*,u32,void*)=(void*)(g_image+entry);
++  fprintf(stderr,"[loader] calling entry (DllMain) ...\n");
++  int r=DllMain((void*)g_imagebase,DLL_PROCESS_ATTACH,0);
++  fprintf(stderr,"[loader] DllMain returned %d\n",r);
++  return r?0:-2;
++}
++
++// find an export by name
++static void* get_export(const char*want){
++  u32 e=f32(0x3c);
++  u32 exprva=f32(e+24+112+8*0);
++  u32 nnames=*(u32*)(g_image+exprva+24);
++  u32 fns=*(u32*)(g_image+exprva+28);
++  u32 names=*(u32*)(g_image+exprva+32);
++  u32 ords=*(u32*)(g_image+exprva+36);
++  for(u32 i=0;i<nnames;i++){
++    u32 nrva=*(u32*)(g_image+names+i*4);
++    if(!strcmp((char*)(g_image+nrva),want)){
++      u16 ord=*(u16*)(g_image+ords+i*2);
++      u32 frva=*(u32*)(g_image+fns+ord*4);
++      return g_image+frva;
++    }
++  }
++  return 0;
++}
++
++// ================= engine driving (mirrors the Go harness) =================
++static u8 pipeline[1024];
++static u8 birbuf[262144];
++
++static u8 small[262144];
++static void resize(u8*src,int sw,int sh,int dw,int dh){ for(int y=0;y<dh;y++)for(int x=0;x<dw;x++) small[y*dw+x]=src[(y*sh/dh)*sw+(x*sw/dw)]; }
++// Prepare the vendor engine's 64x80 frame. Native FTE4800 captures are a direct
++// copy; larger inputs are centre-cropped and smaller inputs are resized for the
++// standalone harness.
++#define FRAME_W 64
++#define FRAME_H 80
++static void prepare_frame(const u8*src,int sw,int sh){
++  if(sw>=FRAME_W && sh>=FRAME_H){
++    int ox=(sw-FRAME_W)/2, oy=(sh-FRAME_H)/2;
++    for(int y=0;y<FRAME_H;y++) for(int x=0;x<FRAME_W;x++) small[y*FRAME_W+x]=src[(oy+y)*sw+(ox+x)];
++  } else {
++    resize((u8*)src, sw, sh, FRAME_W, FRAME_H);
++  }
++}
++static int build_bir(u8*pix,int w,int h){
++  int total=0x48+0x38+w*h; memset(birbuf,0,total);
++  const int HDR=0x18,STD=0x48;
++  *(u32*)(birbuf+0)=0x30; *(u32*)(birbuf+4)=HDR;
++  *(u32*)(birbuf+8)=0x38+w*h; *(u32*)(birbuf+0xc)=STD;
++  *(u16*)(birbuf+HDR+0x28)=0x001B; *(u16*)(birbuf+HDR+0x2a)=0x0401;
++  *(u16*)(birbuf+STD+0x1c)=500; *(u16*)(birbuf+STD+0x1e)=500;
++  birbuf[STD+0x22]=8; birbuf[STD+0x23]=0;
++  *(u16*)(birbuf+STD+0x2c)=w; *(u16*)(birbuf+STD+0x2e)=h;
++  memcpy(birbuf+STD+0x38,pix,w*h);
++  return total;
++}
++
++// ================= STORAGE ADAPTER STUB (pipeline+0x28 vtable) =================
++// Vtable: 0x20 header + function slots (standard WINBIO_STORAGE_INTERFACE order).
++// Offsets the engine calls (verified by disassembly):
++//   +0x68 AddRecord  +0x78 QueryBySubject  +0x90 FirstRecord
++//   +0x98 NextRecord +0xa0 GetCurrentRecord
++// WINBIO_STORAGE_RECORD fields the engine uses: +0x00 Identity*, +0x20 TemplateBlob,
++//   +0x28 TemplateBlobSize.
++static u8  g_rec_identity[76];
++static u8  g_rec_template[1<<20];   // enrollment template can be ~200KB (up to 18 sub-tpls)
++static u64 g_rec_tsize = 0;
++static int g_have_record = 0;
++
++static u64 MS st_default(void*a,void*b,void*c,void*d,void*e,void*f){ return 0; }
++
++static u32 MS st_QueryBySubject(void*pipe,void*identity,u8 sub){
++  fprintf(stderr,"[storage] QueryBySubject(sub=%u) -> %s\n", sub,
++          g_have_record?"S_OK":"NO_RESULTS");
++  if(identity) memcpy(g_rec_identity, identity, sizeof g_rec_identity);
++  return g_have_record ? 0 : 0x8009801f; // WINBIO_E_DATABASE_NO_RESULTS
++}
++static u32 MS st_FirstRecord(void*pipe){
++  fprintf(stderr,"[storage] FirstRecord -> %s\n", g_have_record?"S_OK":"NO_RESULTS");
++  return g_have_record ? 0 : 0x8009801f;
++}
++static u32 MS st_NextRecord(void*pipe){
++  fprintf(stderr,"[storage] NextRecord -> NO_MORE_RECORDS\n");
++  return 0x80098020; // single-record store: always end after the first
++}
++static u32 MS st_GetCurrentRecord(void*pipe,u8*rec){
++  fprintf(stderr,"[storage] GetCurrentRecord (tsize=%lu)\n",(unsigned long)g_rec_tsize);
++  memset(rec,0,0x40);
++  *(u64*)(rec+0x00)=(u64)g_rec_identity;
++  *(u64*)(rec+0x20)=(u64)g_rec_template;
++  *(u64*)(rec+0x28)=g_rec_tsize;
++  return 0;
++}
++static u32 MS st_AddRecord(void*pipe,u8*rec,u8 sub){
++  u64 tp=*(u64*)(rec+0x20), ts=*(u64*)(rec+0x28);
++  u64 idp=*(u64*)(rec+0x00);
++  fprintf(stderr,"[storage] AddRecord(sub=%u) template=%#lx size=%lu\n",sub,(unsigned long)tp,(unsigned long)ts);
++  if(idp) memcpy(g_rec_identity,(void*)idp,sizeof g_rec_identity);
++  if(tp && ts && ts<=sizeof g_rec_template){ memcpy(g_rec_template,(void*)tp,ts); g_rec_tsize=ts; g_have_record=1; }
++  return 0;
++}
++
++static u64 g_storage_vt[0x100/8];
++static u64 g_sensor_vt[0x100/8];
++static void build_storage_vtable(void){
++  for(int i=0;i<0x100/8;i++){ g_storage_vt[i]=(u64)st_default; g_sensor_vt[i]=(u64)st_default; }
++  g_storage_vt[0x68/8]=(u64)st_AddRecord;
++  g_storage_vt[0x78/8]=(u64)st_QueryBySubject;
++  g_storage_vt[0x90/8]=(u64)st_FirstRecord;
++  g_storage_vt[0x98/8]=(u64)st_NextRecord;
++  g_storage_vt[0xa0/8]=(u64)st_GetCurrentRecord;
++}
++
++
++/* ==================== public API (ft_engine.h) ==================== */
++#include "vendor-engine.h"
++#define ENG_W 64
++#define ENG_H 80
++static void *g_iface;
++
++void ft_engine_geometry(int *w,int *h){ if(w)*w=ENG_W; if(h)*h=ENG_H; }
++
++static int g_loaded = 0;
++int ft_engine_open(const char *dll_path){
++  /* Re-arm the %gs TEB on re-open: arch_prctl is per-thread and fprintd
++   * re-opens the device (often on a different thread) between operations. */
++  if(g_loaded){ arm_teb_for_current_thread(); return 0; }
++  g_dllpath = dll_path ? dll_path : "ftWbioEngineAdapter.dll";
++  register_shims();
++  if(load_pe()!=0) return -1;
++  void *q=get_export("WbioQueryEngineInterface");
++  if(!q) return -2;
++  u64 (MS *Query)(void**)=q;
++  void *iface=0;
++  if((u32)Query(&iface)!=0 || !iface) return -3;
++  g_iface=iface;
++  *(u64*)(pipeline+0x08)=~0ULL;
++  build_storage_vtable();
++  *(u64*)(pipeline+0x20)=(u64)g_sensor_vt;
++  *(u64*)(pipeline+0x28)=(u64)g_storage_vt;
++  u64 (MS *Attach)(void*)=*(void**)((u8*)iface+32+0*8);
++  if((u32)Attach(pipeline)!=0) return -4;
++  u64 ctx=*(u64*)(pipeline+0x38);
++  *(u32*)(ctx+0x24)=ENG_W; *(u32*)(ctx+0x28)=ENG_H;
++  g_loaded=1;
++  return 0;
++}
++
++void ft_engine_close(void){
++  /* The engine maps at a fixed base and is loaded once per process; a libfprint
++   * device close/reopen must NOT tear it down (and must not clear g_iface, or the
++   * next open — which short-circuits on the load-once guard — leaves a null
++   * interface and the following engine call segfaults). Intentional no-op. */
++}
++
++uint32_t ft_engine_accept(const uint8_t *img,int sw,int sh,uint8_t purpose){
++  arm_teb_for_current_thread();   /* ensure %gs + stack bounds describe this thread */
++  prepare_frame((const u8*)img, sw, sh);
++  int total=build_bir(small, ENG_W, ENG_H);
++  u32 rej=0;
++  u64 (MS *Accept)(void*,void*,u64,u64,void*)=*(void**)((u8*)g_iface+32+8*8);
++  return (u32)Accept(pipeline, birbuf, total, purpose, &rej);
++}
++
++void ft_engine_enroll_begin(void){
++  arm_teb_for_current_thread();
++  g_have_record=0; g_rec_tsize=0;
++  u64 (MS *Create)(void*)=*(void**)((u8*)g_iface+32+12*8);
++  Create(pipeline);
++}
++
++int ft_engine_enroll_update(void){
++  arm_teb_for_current_thread();
++  u64 (MS *Update)(void*,void*)=*(void**)((u8*)g_iface+32+13*8);
++  u64 (MS *Status)(void*,void*)=*(void**)((u8*)g_iface+32+14*8);
++  u32 urej=0; u64 uhr=Update(pipeline,&urej);
++  if((u32)uhr==0x80098008 || urej) return 2;   /* frame rejected (dup/low quality) */
++  u32 srej=0; u64 shr=Status(pipeline,&srej);
++  return (u32)shr==0 ? 0 : 1;                    /* 0 complete, 1 need more */
++}
++
++static void fill_identity(u8 *id){ memset(id,0,76); *(u32*)id=3; for(int i=0;i<16;i++) id[8+i]=0xA0+i; }
++
++int ft_engine_enroll_commit(uint8_t **out,size_t *outlen){
++  arm_teb_for_current_thread();
++  u8 id[76]; fill_identity(id);
++  g_have_record=0;
++  u64 (MS *Commit)(void*,void*,u8)=*(void**)((u8*)g_iface+32+17*8);
++  if((u32)Commit(pipeline,id,1)!=0 || !g_have_record) return -1;
++  *out=malloc(g_rec_tsize); if(!*out) return -2;
++  memcpy(*out, g_rec_template, g_rec_tsize); *outlen=g_rec_tsize;
++  return 0;
++}
++
++int ft_engine_verify(const uint8_t *tmpl,size_t tmpllen){
++  arm_teb_for_current_thread();
++  if(tmpllen==0 || tmpllen>sizeof g_rec_template) return 0;
++  memcpy(g_rec_template, tmpl, tmpllen); g_rec_tsize=tmpllen; g_have_record=1;
++  u8 id[76]; fill_identity(id);
++  u8 m=0; u32 ps=0,hs=0,vr=0; void*plp=0,*hp=0;
++  u64 (MS *Verify)(void*,void*,u8,void*,void*,void*,void*,void*,void*)=*(void**)((u8*)g_iface+32+10*8);
++  Verify(pipeline, id, 1, &m, &ps, &plp, &hs, &hp, &vr);
++  return m?1:0;
++}
+diff --git a/libfprint/drivers/vendor-engine.h b/libfprint/drivers/vendor-engine.h
+new file mode 100644
+index 00000000..0ba47768
+--- /dev/null
++++ b/libfprint/drivers/vendor-engine.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/* vendor-engine.h — native wrapper around the FocalTech WinBio matcher DLL.
++ * Loads ftWbioEngineAdapter.dll in-process (no Wine) and exposes enroll/verify.
++ * Single-device (global state); fine for one FTE4800 reader. */
++#ifndef FT_ENGINE_H
++#define FT_ENGINE_H
++#include <stddef.h>
++#include <stdint.h>
++
++/* Load + initialize the engine. dll_path = path to ftWbioEngineAdapter.dll.
++ * Returns 0 on success. */
++int  ft_engine_open (const char *dll_path);
++void ft_engine_close (void);
++
++/* The image geometry the engine matches at (64x80). Feed any size; it is
++ * resized internally. */
++void ft_engine_geometry (int *w, int *h);
++
++/* Feed one 8-bit grayscale frame (sw x sh). purpose: 4=enroll, 1=verify.
++ * Returns 0 on success (features extracted), else the engine HRESULT. */
++uint32_t ft_engine_accept (const uint8_t *img, int sw, int sh, uint8_t purpose);
++
++/* Enrollment: begin, then per accepted frame call update, then commit. */
++void ft_engine_enroll_begin (void);
++/* Fold the last accepted frame into the enroll template.
++ * Returns: 0 = complete, 1 = need more samples, 2 = frame rejected. */
++int  ft_engine_enroll_update (void);
++/* Commit the enrollment. On success (*out,*outlen) is a malloc'd template blob
++ * the caller must free. Returns 0 on success. */
++int  ft_engine_enroll_commit (uint8_t **out, size_t *outlen);
++
++/* Verify: load a previously committed template, then match it against the
++ * most recently accepted frame. Returns 1 = match, 0 = no match. */
++int  ft_engine_verify (const uint8_t *tmpl, size_t tmpllen);
++
++#endif
+diff --git a/libfprint/fp-context.c b/libfprint/fp-context.c
+index 70d4062a..018930ea 100644
+--- a/libfprint/fp-context.c
++++ b/libfprint/fp-context.c
+@@ -479,6 +479,7 @@ fp_context_enumerate (FpContext *context)
+ 
+     g_autoptr(GList) spidev_devices = g_udev_client_query_by_subsystem (udev_client, "spidev");
+     g_autoptr(GList) hidraw_devices = g_udev_client_query_by_subsystem (udev_client, "hidraw");
++    g_autoptr(GList) misc_devices = g_udev_client_query_by_subsystem (udev_client, "misc");
+ 
+     /* for each potential driver, try to match all requested resources. */
+     for (i = 0; i < priv->drivers->len; i++)
+@@ -492,7 +493,7 @@ fp_context_enumerate (FpContext *context)
+ 
+         for (entry = cls->id_table; entry->udev_types; entry++)
+           {
+-            GList *matched_spidev = NULL, *matched_hidraw = NULL;
++            GList *matched_spidev = NULL, *matched_hidraw = NULL, *matched_misc = NULL;
+ 
+             if (entry->udev_types & FPI_DEVICE_UDEV_SUBTYPE_SPIDEV)
+               {
+@@ -508,6 +509,19 @@ fp_context_enumerate (FpContext *context)
+                 if (matched_spidev == NULL)
+                   continue;
+               }
++            if (entry->udev_types & FPI_DEVICE_UDEV_SUBTYPE_MISC)
++              {
++                for (matched_misc = misc_devices; matched_misc; matched_misc = matched_misc->next)
++                  {
++                    const gchar *sysfs = g_udev_device_get_sysfs_path (matched_misc->data);
++                    if (!sysfs)
++                      continue;
++                    if (strstr (sysfs, entry->spi_acpi_id))
++                      break;
++                  }
++                if (matched_misc == NULL)
++                  continue;
++              }
+             if (entry->udev_types & FPI_DEVICE_UDEV_SUBTYPE_HIDRAW)
+               {
+                 for (matched_hidraw = hidraw_devices; matched_hidraw; matched_hidraw = matched_hidraw->next)
+@@ -531,13 +545,19 @@ fp_context_enumerate (FpContext *context)
+                   continue;
+               }
+             priv->pending_devices++;
++            const gchar *spidev_path = NULL;
++            if (matched_spidev)
++              spidev_path = g_udev_device_get_device_file (matched_spidev->data);
++            else if (matched_misc)
++              spidev_path = g_udev_device_get_device_file (matched_misc->data);
++
+             g_async_initable_new_async (driver,
+                                         G_PRIORITY_LOW,
+                                         priv->cancellable,
+                                         async_device_init_done_cb,
+                                         context,
+                                         "fpi-driver-data", entry->driver_data,
+-                                        "fpi-udev-data-spidev", (matched_spidev ? g_udev_device_get_device_file (matched_spidev->data) : NULL),
++                                        "fpi-udev-data-spidev", spidev_path,
+                                         "fpi-udev-data-hidraw", (matched_hidraw ? g_udev_device_get_device_file (matched_hidraw->data) : NULL),
+                                         NULL);
+             /* remove entries from list to avoid conflicts */
+@@ -546,6 +566,11 @@ fp_context_enumerate (FpContext *context)
+                 g_object_unref (matched_spidev->data);
+                 spidev_devices = g_list_delete_link (spidev_devices, matched_spidev);
+               }
++            if (matched_misc)
++              {
++                g_object_unref (matched_misc->data);
++                misc_devices = g_list_delete_link (misc_devices, matched_misc);
++              }
+             if (matched_hidraw)
+               {
+                 g_object_unref (matched_hidraw->data);
+@@ -557,6 +582,7 @@ fp_context_enumerate (FpContext *context)
+     /* free all unused elemnts in both lists */
+     g_list_foreach (spidev_devices, (GFunc) g_object_unref, NULL);
+     g_list_foreach (hidraw_devices, (GFunc) g_object_unref, NULL);
++    g_list_foreach (misc_devices, (GFunc) g_object_unref, NULL);
+   }
+ #endif
+ 
+diff --git a/libfprint/fpi-device.c b/libfprint/fpi-device.c
+index a1be30c0..0accf408 100644
+--- a/libfprint/fpi-device.c
++++ b/libfprint/fpi-device.c
+@@ -437,6 +437,7 @@ fpi_device_get_udev_data (FpDevice *device, FpiDeviceUdevSubtypeFlags subtype)
+       return priv->udev_data.hidraw_path;
+ 
+     case FPI_DEVICE_UDEV_SUBTYPE_SPIDEV:
++    case FPI_DEVICE_UDEV_SUBTYPE_MISC:
+       return priv->udev_data.spidev_path;
+ 
+     default:
+diff --git a/libfprint/fpi-device.h b/libfprint/fpi-device.h
+index ab154bc1..26a63732 100644
+--- a/libfprint/fpi-device.h
++++ b/libfprint/fpi-device.h
+@@ -34,6 +34,7 @@
+ typedef enum {
+   FPI_DEVICE_UDEV_SUBTYPE_SPIDEV = 1 << 0,
+   FPI_DEVICE_UDEV_SUBTYPE_HIDRAW = 1 << 1,
++  FPI_DEVICE_UDEV_SUBTYPE_MISC   = 1 << 2,
+ } FpiDeviceUdevSubtypeFlags;
+ 
+ /**
+diff --git a/libfprint/fprint-list-supported-devices.c b/libfprint/fprint-list-supported-devices.c
+index 1b02c0b2..b1341018 100644
+--- a/libfprint/fprint-list-supported-devices.c
++++ b/libfprint/fprint-list-supported-devices.c
+@@ -70,7 +70,7 @@ insert_drivers (GList **usb_list, GList **spi_list)
+               char *key;
+ 
+               /* Need SPI device */
+-              if ((entry->udev_types & FPI_DEVICE_UDEV_SUBTYPE_SPIDEV) == 0)
++              if ((entry->udev_types & (FPI_DEVICE_UDEV_SUBTYPE_SPIDEV | FPI_DEVICE_UDEV_SUBTYPE_MISC)) == 0)
+                 continue;
+ 
+               key = g_strdup_printf ("SPI:%s:%04x:%04x", entry->spi_acpi_id, entry->hid_id.vid, entry->hid_id.pid);
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index 34494813..c293942c 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -153,6 +153,8 @@ driver_sources = {
+         [ 'drivers/realtek/realtek.c' ],
+     'focaltech_moc' :
+         [ 'drivers/focaltech_moc/focaltech_moc.c' ],
++    'fte4800' :
++        [ 'drivers/fte4800.c', 'drivers/vendor-engine.c' ],
+ }
+ 
+ helper_sources = {
+diff --git a/meson.build b/meson.build
+index 14fb11f2..79760257 100644
+--- a/meson.build
++++ b/meson.build
+@@ -147,7 +147,8 @@ default_drivers = [
+ ]
+ 
+ spi_drivers = [
+-    'elanspi'
++    'elanspi',
++    'fte4800'
+ ]
+ 
+ if have_spi
+@@ -211,6 +212,7 @@ driver_helper_mapping = {
+     'aes4000' : [ 'aeslib', 'aes3k' ],
+     'uru4000' : [ 'openssl' ],
+     'elanspi' : [ 'udev' ],
++    'fte4800' : [ 'udev' ],
+     'virtual_image'          : [ 'virtual' ],
+     'virtual_device'         : [ 'virtual' ],
+     'virtual_device_storage' : [ 'virtual' ],

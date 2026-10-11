@@ -1,0 +1,13 @@
+#%PAM-1.0
+# Local fingerprint authentication; password remains available.
+auth requisite pam_faillock.so preauth
+# Skip the fingerprint path when sudo has no terminal.
+auth [success=1 default=ignore] pam_succeed_if.so quiet tty in :unknown
+auth [success=1 default=ignore] pam_fprintd.so max-tries=3 timeout=10
+auth substack system-auth
+auth required pam_env.so
+auth required pam_faillock.so authsucc
+# End local fingerprint authentication.
+account		include		system-auth
+session		include		system-auth
+session		optional	pam_systemd.so class=none
