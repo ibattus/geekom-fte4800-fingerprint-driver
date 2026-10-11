@@ -76,6 +76,14 @@ The package replaces `focaltech-spi-dkms` and provides its dependency name.
 Check `dkms status` if installation reports missing kernel headers or a build
 failure. The installed module has an FTE4800 ACPI alias for discovery at boot.
 
+## AUR package preparation
+
+A self-contained `focaltech-fte4800-geekom` recipe is available in
+[packaging/aur/](packaging/aur/README.md), including generated `.SRCINFO`.
+It downloads pinned source archives and has passed a standalone package build
+and the three libfprint core unit suites. **It has not yet been submitted to
+AUR**; an AUR account with a registered SSH key is still needed.
+
 ## Enroll and verify
 
 ```sh

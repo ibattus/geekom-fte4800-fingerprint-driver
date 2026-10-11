@@ -54,3 +54,8 @@ packaging/arch/*.cab
 /authentication/
 /pam-backups/
 *.original
+
+# AUR local build artifacts
+packaging/aur/src/
+packaging/aur/pkg/
+packaging/aur/*.tar.gz

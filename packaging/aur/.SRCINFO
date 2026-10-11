@@ -1,0 +1,43 @@
+pkgbase = focaltech-fte4800-geekom
+	pkgdesc = FocalTech FTE4800/FT9368 SPI fingerprint driver for GEEKOM NX14CM
+	pkgver = 1.0.3
+	pkgrel = 1
+	url = https://github.com/ibattus/geekom-fte4800-fingerprint-driver
+	install = focaltech-fte4800-geekom.install
+	arch = x86_64
+	license = GPL-2.0-only
+	license = LGPL-2.1-or-later
+	license = LicenseRef-FocalTech-Proprietary
+	makedepends = cabextract
+	makedepends = glib2-devel
+	makedepends = gobject-introspection
+	makedepends = gtk-doc
+	makedepends = meson
+	makedepends = ninja
+	makedepends = python-cairo
+	makedepends = python-gobject
+	makedepends = systemd
+	depends = dkms
+	depends = fprintd
+	depends = glib2
+	depends = glibc
+	depends = libgcc
+	depends = libgudev
+	depends = libgusb
+	optdepends = linux-headers: headers for the standard Arch kernel; install matching headers for other kernels
+	provides = focaltech-spi-dkms=1.0.3
+	provides = focaltech-fte4800=1.0.3
+	conflicts = focaltech-spi-dkms
+	conflicts = focaltech-fte4800
+	noextract = fte4800-windows.cab
+	options = !debug
+	source = geekom-fte4800-03bb80e52e043704b7bcab272f628193d9bae795.tar.gz::https://github.com/ibattus/geekom-fte4800-fingerprint-driver/archive/03bb80e52e043704b7bcab272f628193d9bae795.tar.gz
+	source = libfprint-v1.94.10.tar.gz::https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v1.94.10/libfprint-v1.94.10.tar.gz
+	source = focaltech-fte4800-geekom.install
+	source = fte4800-windows.cab::https://catalog.s.download.windowsupdate.com/d/msdownload/update/driver/drvs/2023/03/e09de0fb-1dd7-4921-8b47-d78ddee90e1d_fb450d406219a3326ab0703613361b35506a559c.cab
+	sha256sums = d67a511673464a10e41c411decf6d88aef3e9d86f2dcb3df1ee04d68753dca2f
+	sha256sums = 8d5b202e836f69076c90ead0a654b0ee275788922359ebc9d7706bb5cde7ca54
+	sha256sums = ff6e55e2c51f2ae1093ecd1c476fd692045f42d65dfffa8818890bec886dda1e
+	sha256sums = fd589acfa49cca3a1fde87190e9f84ebfb62dee7ecd282007a1b4b6bbd0a3faf
+
+pkgname = focaltech-fte4800-geekom

@@ -13,7 +13,7 @@ jobs:
         run: tests/run-tests.sh
       - name: Shell syntax
         run: |
-          for script in install/*.sh tests/run-tests.sh tools/*.sh packaging/arch/PKGBUILD packaging/arch/focaltech-fte4800.install; do
+          for script in install/*.sh tests/run-tests.sh tools/*.sh packaging/arch/PKGBUILD packaging/arch/focaltech-fte4800.install packaging/aur/PKGBUILD packaging/aur/*.install; do
             bash -n "$script" || exit
           done
       - name: Check whitespace
